@@ -10,7 +10,8 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.0.0",
-    "hono": "^4.4.0"
+    "hono": "^4.4.0",
+    "pdf-lib": "^1.17.1"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240725.0",
