@@ -425,9 +425,11 @@ app.get('/api/templates', requireAuth, async (req, res) => {
 app.post('/api/templates', requireAuth, upload.single('template'), async (req, res) => {
   if (!supabase) return res.status(503).json({ message: 'Database tidak dikonfigurasi' });
 
-  const { name, category } = req.body;
+  // Support both 'templateName' (dari frontend) dan 'name' (API langsung)
+  const name = req.body.templateName || req.body.name;
+  const category = req.body.category;
   if (!name || !category) {
-    return res.status(400).json({ message: 'Field name dan category diperlukan' });
+    return res.status(400).json({ message: 'Field name/templateName dan category diperlukan' });
   }
 
   let driveFileId = null;
