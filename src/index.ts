@@ -18,7 +18,7 @@ interface Env {
   SUPABASE_SERVICE_ROLE_KEY: string;
   GOOGLE_PRIVATE_KEY: string;
   GOOGLE_CLIENT_EMAIL: string;
-  GOOGLE_DRIVE_ROOT_FOLDER_ID: string;
+  GOOGLE_DRIVE_ROOT_FOLDER_ID?: string;
   FRONTEND_URL?: string;
   APP_ORIGIN?: string;
   CORS_ORIGINS?: string;
@@ -32,169 +32,44 @@ const ROMAN_MONTHS = ['I','II','III','IV','V','VI','VII','VIII','IX','X','XI','X
 // ─────────────────────────────────────────────
 // Helpers: Folder ID sanitizer
 // ─────────────────────────────────────────────
-function extractDriveFolderId(raw: string): string {
-  if (!raw) return '';
-  const trimmed = raw.trim();
-  const folderMatch = trimmed.match(/\/folders\/([a-zA-Z0-9_-]+)/);
-  if (folderMatch) return folderMatch[1];
-  const queryMatch = trimmed.match(/^([a-zA-Z0-9_-]+)/);
-  if (queryMatch && trimmed.includes('?')) return queryMatch[1];
-  return trimmed;
-}
 
+// Supabase Storage: upload file ke bucket 'arsip-files'
+// Tidak butuh quota — gratis 1GB di Supabase free tier
 // ─────────────────────────────────────────────
-// Helpers: Resolve Google Credentials
-// ─────────────────────────────────────────────
-interface GoogleCreds {
-  client_email: string;
-  private_key: string;
-}
-
-function resolveGoogleCredentials(env: Env): GoogleCreds | null {
-  const raw = env.GOOGLE_PRIVATE_KEY || '';
-  // Prioritas 1: GOOGLE_PRIVATE_KEY berisi JSON lengkap service account
-  if (raw.trim().startsWith('{')) {
-    try {
-      const parsed = JSON.parse(raw);
-      if (parsed.client_email && parsed.private_key) {
-        return { client_email: parsed.client_email, private_key: parsed.private_key };
-      }
-    } catch (_) {}
-  }
-  // Prioritas 2: GOOGLE_PRIVATE_KEY berisi PEM key string + GOOGLE_CLIENT_EMAIL terpisah
-  if (env.GOOGLE_CLIENT_EMAIL && raw) {
-    const normalised = raw.replace(/\\n/g, '\n');
-    return { client_email: env.GOOGLE_CLIENT_EMAIL, private_key: normalised };
-  }
-  return null;
-}
-
-// ─────────────────────────────────────────────
-// Google Drive via fetch manual (JWT)
-// Web Crypto API — tidak butuh googleapis package
-// ─────────────────────────────────────────────
-async function getGoogleAccessToken(creds: GoogleCreds): Promise<string> {
-  const now = Math.floor(Date.now() / 1000);
-  const header = { alg: 'RS256', typ: 'JWT' };
-  const payload = {
-    iss: creds.client_email,
-    scope: 'https://www.googleapis.com/auth/drive',
-    aud: 'https://oauth2.googleapis.com/token',
-    exp: now + 3600,
-    iat: now,
-  };
-
-  const encode = (obj: object) =>
-    btoa(JSON.stringify(obj))
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=/g, '');
-
-  const headerB64 = encode(header);
-  const payloadB64 = encode(payload);
-  const signingInput = `${headerB64}.${payloadB64}`;
-
-  // Import private key PEM
-  const pemContents = creds.private_key
-    .replace(/-----BEGIN PRIVATE KEY-----/, '')
-    .replace(/-----END PRIVATE KEY-----/, '')
-    .replace(/\s/g, '');
-
-  const binaryDer = Uint8Array.from(atob(pemContents), c => c.charCodeAt(0));
-
-  const cryptoKey = await crypto.subtle.importKey(
-    'pkcs8',
-    binaryDer.buffer,
-    { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' },
-    false,
-    ['sign']
-  );
-
-  const signatureBytes = await crypto.subtle.sign(
-    'RSASSA-PKCS1-v1_5',
-    cryptoKey,
-    new TextEncoder().encode(signingInput)
-  );
-
-  const signature = btoa(String.fromCharCode(...new Uint8Array(signatureBytes)))
-    .replace(/\+/g, '-')
-    .replace(/\//g, '_')
-    .replace(/=/g, '');
-
-  const jwt = `${signingInput}.${signature}`;
-
-  // Exchange JWT for access token
-  const tokenRes = await fetch('https://oauth2.googleapis.com/token', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      grant_type: 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-      assertion: jwt,
-    }),
-  });
-
-  const tokenData = await tokenRes.json() as { access_token?: string; error?: string };
-  if (!tokenData.access_token) {
-    throw new Error(`Google token error: ${tokenData.error || 'unknown'}`);
-  }
-  return tokenData.access_token;
-}
-
-// ─────────────────────────────────────────────
-// Upload file ke Google Drive via REST API
-// ─────────────────────────────────────────────
-async function uploadToDrive(
+async function uploadToSupabaseStorage(
   fileBuffer: ArrayBuffer,
   fileName: string,
   mimeType: string,
-  folderId: string,
-  creds: GoogleCreds
-): Promise<{ drive_file_id: string; drive_web_view_link: string } | null> {
+  supabaseUrl: string,
+  supabaseKey: string
+): Promise<{ file_path: string; public_url: string } | null> {
   try {
-    const accessToken = await getGoogleAccessToken(creds);
-
-    // Multipart upload ke Drive API v3
-    const boundary = '-------314159265358979323846';
-    const metadata = JSON.stringify({ name: fileName, parents: [folderId] });
-
-    const body = [
-      `--${boundary}`,
-      'Content-Type: application/json; charset=UTF-8',
-      '',
-      metadata,
-      `--${boundary}`,
-      `Content-Type: ${mimeType}`,
-      'Content-Transfer-Encoding: base64',
-      '',
-      btoa(String.fromCharCode(...new Uint8Array(fileBuffer))),
-      `--${boundary}--`,
-    ].join('\r\n');
-
+    const bucket = 'arsip-files';
+    const path = `uploads/${Date.now()}_${fileName.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    
     const uploadRes = await fetch(
-      'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink',
+      `${supabaseUrl}/storage/v1/object/${bucket}/${path}`,
       {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${accessToken}`,
-          'Content-Type': `multipart/related; boundary="${boundary}"`,
+          'Authorization': `Bearer ${supabaseKey}`,
+          'Content-Type': mimeType,
+          'x-upsert': 'true',
         },
-        body,
+        body: fileBuffer,
       }
     );
 
-    const uploadData = await uploadRes.json() as { id?: string; webViewLink?: string; error?: any };
-
-    if (!uploadRes.ok || !uploadData.id) {
-      console.error('[Drive] Upload gagal:', JSON.stringify(uploadData.error));
+    if (!uploadRes.ok) {
+      const errData = await uploadRes.json() as any;
+      console.error('[Storage] Upload gagal:', JSON.stringify(errData));
       return null;
     }
 
-    return {
-      drive_file_id: uploadData.id,
-      drive_web_view_link: uploadData.webViewLink || `https://drive.google.com/file/d/${uploadData.id}/view`,
-    };
+    const publicUrl = `${supabaseUrl}/storage/v1/object/public/${bucket}/${path}`;
+    return { file_path: path, public_url: publicUrl };
   } catch (err: any) {
-    console.error('[Drive] uploadToDrive error:', err.message);
+    console.error('[Storage] uploadToSupabaseStorage error:', err.message);
     return null;
   }
 }
@@ -496,7 +371,7 @@ app.get('/api/health', async (c) => {
     timestamp: new Date().toISOString(),
     env: {
       supabase: !!(env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY),
-      google: !!(env.GOOGLE_PRIVATE_KEY && env.GOOGLE_DRIVE_ROOT_FOLDER_ID),
+      storage: !!(env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY),
       jwt: !!env.JWT_SECRET,
     },
   });
@@ -582,36 +457,30 @@ app.post('/api/templates', requireAuth, async (c) => {
     return c.json({ message: 'Ukuran file melebihi batas 50MB' }, 413);
   }
 
-  let driveFileId: string | null = null;
-  let driveWebViewLink: string | null = null;
+  let storageFilePath: string | null = null;
+  let storagePublicUrl: string | null = null;
 
-  if (file && file.size > 0 && env.GOOGLE_DRIVE_ROOT_FOLDER_ID) {
-    const creds = resolveGoogleCredentials(env);
-    if (creds) {
-      try {
-        const folderId = extractDriveFolderId(env.GOOGLE_DRIVE_ROOT_FOLDER_ID);
-        const fileName = `${Date.now()}_${file.name}`;
-        const fileBuffer = await file.arrayBuffer();
-        const result = await uploadToDrive(
-          fileBuffer,
-          fileName,
-          file.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-          folderId,
-          creds
-        );
-        if (result) {
-          driveFileId = result.drive_file_id;
-          driveWebViewLink = result.drive_web_view_link;
-        }
-      } catch (driveErr: any) {
-        console.error('[Drive] Upload template gagal:', driveErr.message);
+  if (file && file.size > 0 && env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY) {
+    try {
+      const fileName = `${Date.now()}_${file.name}`;
+      const fileBuffer = await file.arrayBuffer();
+      const result = await uploadToSupabaseStorage(
+        fileBuffer, fileName,
+        file.type || 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY
+      );
+      if (result) {
+        storageFilePath = result.file_path;
+        storagePublicUrl = result.public_url;
       }
+    } catch (storageErr: any) {
+      console.error('[Storage] Upload template gagal:', storageErr.message);
     }
   }
 
   const { data, error } = await supabase
     .from('templates')
-    .insert([{ name, category, drive_file_id: driveFileId, drive_web_view_link: driveWebViewLink }])
+    .insert([{ name, category, drive_file_id: storageFilePath, drive_web_view_link: storagePublicUrl }])
     .select()
     .single();
 
@@ -784,26 +653,22 @@ app.post('/api/archives/manual-upload', requireAuth, async (c) => {
   let driveWebViewLink: string | null = null;
   let syncStatus = 'local';
 
-  if (file && file.size > 0 && env.GOOGLE_DRIVE_ROOT_FOLDER_ID) {
-    const creds = resolveGoogleCredentials(env);
-    if (creds) {
-      try {
-        const folderId = extractDriveFolderId(env.GOOGLE_DRIVE_ROOT_FOLDER_ID);
-        const fileName = `${Date.now()}_${file.name}`;
-        const fileBuffer = await file.arrayBuffer();
-        const result = await uploadToDrive(
-          fileBuffer, fileName,
-          file.type || 'application/octet-stream',
-          folderId, creds
-        );
-        if (result) {
-          driveFileId = result.drive_file_id;
-          driveWebViewLink = result.drive_web_view_link;
-          syncStatus = 'synced';
-        }
-      } catch (driveErr: any) {
-        console.error('[Drive] Upload arsip gagal:', driveErr.message);
+  if (file && file.size > 0 && env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY) {
+    try {
+      const fileName = `${Date.now()}_${file.name}`;
+      const fileBuffer = await file.arrayBuffer();
+      const result = await uploadToSupabaseStorage(
+        fileBuffer, fileName,
+        file.type || 'application/octet-stream',
+        env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY
+      );
+      if (result) {
+        driveFileId = result.file_path;
+        driveWebViewLink = result.public_url;
+        syncStatus = 'synced';
       }
+    } catch (storageErr: any) {
+      console.error('[Storage] Upload arsip gagal:', storageErr.message);
     }
   }
 
@@ -885,25 +750,21 @@ app.post('/api/archives/generate-pdf', requireAuth, async (c) => {
     return c.json({ message: `Gagal membuat PDF: ${pdfErr.message}` }, 500);
   }
 
-  // Upload PDF ke Drive
-  if (env.GOOGLE_DRIVE_ROOT_FOLDER_ID) {
-    const creds = resolveGoogleCredentials(env);
-    if (creds) {
-      try {
-        const folderId = extractDriveFolderId(env.GOOGLE_DRIVE_ROOT_FOLDER_ID);
-        const fileName = `${letterNumber.replace(/\//g, '-')}.pdf`;
-        const pdfAB: ArrayBuffer = pdfBytes!.buffer.slice(pdfBytes!.byteOffset, pdfBytes!.byteOffset + pdfBytes!.byteLength) as ArrayBuffer;
-        const result = await uploadToDrive(pdfAB, fileName, 'application/pdf', folderId, creds);
-        if (result) {
-          await supabase.from('archives').update({
-            drive_file_id: result.drive_file_id,
-            drive_web_view_link: result.drive_web_view_link,
-            sync_status: 'synced',
-          }).eq('id', archiveData.id);
-        }
-      } catch (driveErr: any) {
-        console.error('[Drive] Upload PDF gagal:', driveErr.message);
+  // Upload PDF ke Supabase Storage
+  if (env.SUPABASE_URL && env.SUPABASE_SERVICE_ROLE_KEY) {
+    try {
+      const fileName = `${letterNumber.replace(/\//g, '-')}.pdf`;
+      const pdfAB: ArrayBuffer = pdfBytes!.buffer.slice(pdfBytes!.byteOffset, pdfBytes!.byteOffset + pdfBytes!.byteLength) as ArrayBuffer;
+      const result = await uploadToSupabaseStorage(pdfAB, fileName, 'application/pdf', env.SUPABASE_URL, env.SUPABASE_SERVICE_ROLE_KEY);
+      if (result) {
+        await supabase.from('archives').update({
+          drive_file_id: result.file_path,
+          drive_web_view_link: result.public_url,
+          sync_status: 'synced',
+        }).eq('id', archiveData.id);
       }
+    } catch (storageErr: any) {
+      console.error('[Storage] Upload PDF gagal:', storageErr.message);
     }
   }
 
@@ -995,3 +856,5 @@ app.onError((err, c) => {
 });
 
 export default app;
+
+
