@@ -20,7 +20,7 @@ const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || '';
 const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || '';
-const GOOGLE_PRIVATE_KEY = (process.env.GOOGLE_PRIVATE_KEY || '').replace(/\\n/g, '\n');
+const GOOGLE_PRIVATE_KEY_RAW = process.env.GOOGLE_PRIVATE_KEY || '';
 const GOOGLE_DRIVE_ROOT_FOLDER_ID = process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID || '';
 
 const ROMAN_MONTHS = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII'];
@@ -37,21 +37,59 @@ if (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY) {
 
 // ─────────────────────────────────────────────
 // Google Drive Client
+// Mendukung 3 format env var:
+//   1. GOOGLE_PRIVATE_KEY berisi JSON lengkap service account
+//   2. GOOGLE_PRIVATE_KEY berisi hanya private key string
+//   3. GOOGLE_SERVICE_ACCOUNT_JSON berisi JSON lengkap (opsional)
 // ─────────────────────────────────────────────
 let driveEnabled = false;
 let driveClient = null;
 
-if (GOOGLE_CLIENT_EMAIL && GOOGLE_PRIVATE_KEY && GOOGLE_DRIVE_ROOT_FOLDER_ID) {
+function resolveGoogleCredentials() {
+  // Prioritas 1: env var GOOGLE_SERVICE_ACCOUNT_JSON (JSON lengkap)
+  const saJson = process.env.GOOGLE_SERVICE_ACCOUNT_JSON;
+  if (saJson) {
+    try {
+      const parsed = JSON.parse(saJson);
+      if (parsed.client_email && parsed.private_key) return parsed;
+    } catch (_) {}
+  }
+
+  // Prioritas 2: GOOGLE_PRIVATE_KEY berisi JSON lengkap service account
+  if (GOOGLE_PRIVATE_KEY_RAW && GOOGLE_PRIVATE_KEY_RAW.trim().startsWith('{')) {
+    try {
+      const parsed = JSON.parse(GOOGLE_PRIVATE_KEY_RAW);
+      if (parsed.client_email && parsed.private_key) {
+        console.log('[Drive] GOOGLE_PRIVATE_KEY berisi JSON service account — parsing otomatis');
+        return parsed;
+      }
+    } catch (_) {}
+  }
+
+  // Prioritas 3: GOOGLE_PRIVATE_KEY berisi PEM key string + GOOGLE_CLIENT_EMAIL terpisah
+  if (GOOGLE_CLIENT_EMAIL && GOOGLE_PRIVATE_KEY_RAW) {
+    // Normalise escaped newlines \\n → \n
+    const normalised = GOOGLE_PRIVATE_KEY_RAW.replace(/\\n/g, '\n');
+    return { client_email: GOOGLE_CLIENT_EMAIL, private_key: normalised };
+  }
+
+  return null;
+}
+
+if (GOOGLE_DRIVE_ROOT_FOLDER_ID) {
   try {
-    const auth = new google.auth.GoogleAuth({
-      credentials: {
-        client_email: GOOGLE_CLIENT_EMAIL,
-        private_key: GOOGLE_PRIVATE_KEY,
-      },
-      scopes: ['https://www.googleapis.com/auth/drive'],
-    });
-    driveClient = google.drive({ version: 'v3', auth });
-    driveEnabled = true;
+    const creds = resolveGoogleCredentials();
+    if (creds) {
+      const auth = new google.auth.GoogleAuth({
+        credentials: creds,
+        scopes: ['https://www.googleapis.com/auth/drive'],
+      });
+      driveClient = google.drive({ version: 'v3', auth });
+      driveEnabled = true;
+      console.log('[Drive] Inisialisasi berhasil, email:', creds.client_email);
+    } else {
+      console.warn('[Drive] Credentials tidak ditemukan — Google Drive dinonaktifkan');
+    }
   } catch (err) {
     console.error('[Drive] Gagal inisialisasi Google Drive:', err.message);
   }
@@ -860,24 +898,21 @@ app.get('/api/debug/drive', requireAuth, async (req, res) => {
       GOOGLE_CLIENT_EMAIL: GOOGLE_CLIENT_EMAIL
         ? GOOGLE_CLIENT_EMAIL.substring(0, 30) + '…'
         : 'MISSING',
-      GOOGLE_PRIVATE_KEY_LENGTH: GOOGLE_PRIVATE_KEY ? GOOGLE_PRIVATE_KEY.length : 0,
-      GOOGLE_PRIVATE_KEY_STARTS: GOOGLE_PRIVATE_KEY
-        ? GOOGLE_PRIVATE_KEY.substring(0, 40)
+      GOOGLE_PRIVATE_KEY_LENGTH: GOOGLE_PRIVATE_KEY_RAW ? GOOGLE_PRIVATE_KEY_RAW.length : 0,
+      GOOGLE_PRIVATE_KEY_STARTS: GOOGLE_PRIVATE_KEY_RAW
+        ? GOOGLE_PRIVATE_KEY_RAW.substring(0, 40)
         : 'MISSING',
-      GOOGLE_PRIVATE_KEY_ENDS: GOOGLE_PRIVATE_KEY
-        ? GOOGLE_PRIVATE_KEY.substring(GOOGLE_PRIVATE_KEY.length - 40)
+      GOOGLE_PRIVATE_KEY_ENDS: GOOGLE_PRIVATE_KEY_RAW
+        ? GOOGLE_PRIVATE_KEY_RAW.substring(GOOGLE_PRIVATE_KEY_RAW.length - 40)
         : 'MISSING',
+      GOOGLE_PRIVATE_KEY_IS_JSON: GOOGLE_PRIVATE_KEY_RAW
+        ? GOOGLE_PRIVATE_KEY_RAW.trim().startsWith('{')
+        : false,
       GOOGLE_DRIVE_ROOT_FOLDER_ID: GOOGLE_DRIVE_ROOT_FOLDER_ID
         ? GOOGLE_DRIVE_ROOT_FOLDER_ID.substring(0, 10) + '…'
         : 'MISSING',
-      GOOGLE_PRIVATE_KEY_RAW_SNIPPET:
-        process.env.GOOGLE_PRIVATE_KEY
-          ? process.env.GOOGLE_PRIVATE_KEY.substring(0, 60)
-          : 'MISSING',
-      has_literal_newline: GOOGLE_PRIVATE_KEY ? GOOGLE_PRIVATE_KEY.includes('\n') : false,
-      has_escaped_newline: process.env.GOOGLE_PRIVATE_KEY
-        ? process.env.GOOGLE_PRIVATE_KEY.includes('\\n')
-        : false,
+      has_literal_newline: GOOGLE_PRIVATE_KEY_RAW ? GOOGLE_PRIVATE_KEY_RAW.includes('\n') : false,
+      has_escaped_newline: GOOGLE_PRIVATE_KEY_RAW ? GOOGLE_PRIVATE_KEY_RAW.includes('\\n') : false,
     },
     drive_enabled: driveEnabled,
     drive_client_initialized: !!driveClient,
