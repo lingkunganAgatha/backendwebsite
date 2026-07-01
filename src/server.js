@@ -21,7 +21,21 @@ const SUPABASE_URL = process.env.SUPABASE_URL || '';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const GOOGLE_CLIENT_EMAIL = process.env.GOOGLE_CLIENT_EMAIL || '';
 const GOOGLE_PRIVATE_KEY_RAW = process.env.GOOGLE_PRIVATE_KEY || '';
-const GOOGLE_DRIVE_ROOT_FOLDER_ID = process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID || '';
+// Sanitasi GOOGLE_DRIVE_ROOT_FOLDER_ID: ekstrak ID murni dari URL jika perlu
+// Contoh URL: https://drive.google.com/drive/folders/1CFz4jnnha...?hl=ID
+function extractDriveFolderId(raw) {
+  if (!raw) return '';
+  const trimmed = raw.trim();
+  // Cek apakah ini URL Google Drive
+  const folderMatch = trimmed.match(/\/folders\/([a-zA-Z0-9_-]+)/);
+  if (folderMatch) return folderMatch[1];
+  // Cek apakah ada query string yang perlu dibuang
+  const queryMatch = trimmed.match(/^([a-zA-Z0-9_-]+)/);
+  if (queryMatch && trimmed.includes('?')) return queryMatch[1];
+  // Sudah berupa ID murni
+  return trimmed;
+}
+const GOOGLE_DRIVE_ROOT_FOLDER_ID = extractDriveFolderId(process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID || '');
 
 const ROMAN_MONTHS = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII'];
 
@@ -908,9 +922,10 @@ app.get('/api/debug/drive', requireAuth, async (req, res) => {
       GOOGLE_PRIVATE_KEY_IS_JSON: GOOGLE_PRIVATE_KEY_RAW
         ? GOOGLE_PRIVATE_KEY_RAW.trim().startsWith('{')
         : false,
-      GOOGLE_DRIVE_ROOT_FOLDER_ID: GOOGLE_DRIVE_ROOT_FOLDER_ID
-        ? GOOGLE_DRIVE_ROOT_FOLDER_ID.substring(0, 10) + '…'
+      GOOGLE_DRIVE_ROOT_FOLDER_ID_RAW: process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID
+        ? process.env.GOOGLE_DRIVE_ROOT_FOLDER_ID.substring(0, 80)
         : 'MISSING',
+      GOOGLE_DRIVE_ROOT_FOLDER_ID_PARSED: GOOGLE_DRIVE_ROOT_FOLDER_ID || 'EMPTY_AFTER_PARSE',
       has_literal_newline: GOOGLE_PRIVATE_KEY_RAW ? GOOGLE_PRIVATE_KEY_RAW.includes('\n') : false,
       has_escaped_newline: GOOGLE_PRIVATE_KEY_RAW ? GOOGLE_PRIVATE_KEY_RAW.includes('\\n') : false,
     },
