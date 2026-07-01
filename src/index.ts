@@ -851,6 +851,7 @@ app.post('/api/archives/take-number', requireAuth, async (c) => {
     nama_arsip: perihalSurat || `Surat ${kodeJenis} - ${letterNumber}`,
     jenis_arsip: kodeJenis, letter_number: letterNumber, letter_type: kodeJenis,
     letter_subject: perihalSurat||null, request_date: letterDate,
+    letter_date: letterDate,
     archive_month: date.getMonth()+1, archive_year: date.getFullYear(), sync_status:'local',
   }]).select().single();
   if (error) return c.json({ message:`Gagal menyimpan: ${error.message}` }, 500);
@@ -934,14 +935,66 @@ app.post('/api/archives/generate-pdf', requireAuth, async (c) => {
   const { letterNumber, letterDate } = await generateLetterNumber(kategoriSurat, tanggalPermohonan, supabase);
   const date = new Date(letterDate);
 
-  // ── Simpan ke DB ──
-  const { data:archiveData, error:dbError } = await supabase.from('archives').insert([{
-    nama_arsip: nama, jenis_arsip: kodeJenis,
-    letter_number: letterNumber, letter_type: kodeJenis,
-    letter_subject: perihalSurat||null, request_date: letterDate,
-    archive_month: date.getMonth()+1, archive_year: date.getFullYear(), sync_status:'local',
-  }]).select().single();
-  if (dbError) return c.json({ message:`Gagal menyimpan arsip: ${dbError.message}` }, 500);
+  // ── Simpan ke DB (termasuk semua field data umat) ──
+  const insertPayload: Record<string, any> = {
+    nama_arsip:    nama,
+    jenis_arsip:   kodeJenis,
+    letter_number: letterNumber,
+    letter_type:   kodeJenis,
+    letter_subject: perihalSurat || null,
+    request_date:  letterDate,
+    letter_date:   letterDate,
+    archive_month: date.getMonth() + 1,
+    archive_year:  date.getFullYear(),
+    sync_status:   'local',
+    // Data umat — disimpan agar tidak hilang jika file storage terhapus
+    alamat_asal:      alamatAsal       || null,
+    alamat_baru:      alamatBaru       || null,
+    lingkungan_tujuan: lingkunganTujuan || null,
+    stasi_tujuan:     stasiTujuan      || null,
+    paroki_tujuan:    paroki           || null,
+    penandatangan:    penandatangan    || null,
+  };
+
+  const { data:archiveData, error:dbError } = await supabase.from('archives')
+    .insert([insertPayload]).select().single();
+  if (dbError) {
+    // Jika gagal karena kolom belum ada (migrasi belum dijalankan),
+    // fallback ke insert tanpa kolom baru
+    if (dbError.message && dbError.message.includes('column') && dbError.message.includes('does not exist')) {
+      const fallbackPayload = {
+        nama_arsip: nama, jenis_arsip: kodeJenis,
+        letter_number: letterNumber, letter_type: kodeJenis,
+        letter_subject: perihalSurat||null, request_date: letterDate,
+        letter_date: letterDate,
+        archive_month: date.getMonth()+1, archive_year: date.getFullYear(), sync_status:'local',
+      };
+      const { data:fb, error:fe } = await supabase.from('archives').insert([fallbackPayload]).select().single();
+      if (fe) return c.json({ message:`Gagal menyimpan arsip: ${fe.message}` }, 500);
+      // Override archiveData dengan fallback
+      Object.assign(archiveData ?? {}, fb);
+      // continue with fb as archiveData
+      const { data:archiveData2, error:dbError2 } = { data: fb, error: null };
+      if (!archiveData2) return c.json({ message:'Gagal menyimpan arsip (fallback)' }, 500);
+      // Use archiveData2 for the rest
+      const pdfBytes2 = await generateSuratPindahPDF({
+        letterNumber, letterDate,
+        nama: nama || '', alamatAsal: alamatAsal || '-', alamatBaru: alamatBaru || '-',
+        lingkunganTujuan: lingkunganTujuan || '-', stasiTujuan: stasiTujuan || '-',
+        paroki: paroki || '-', penandatangan: penandatangan || 'Ketua Lingkungan',
+        perihalSurat: perihalSurat || 'Surat Pindah',
+      });
+      const safeNum2 = letterNumber.replace(/\//g, '-');
+      const outFile2 = `surat-${safeNum2}.pdf`;
+      const pdfAB2 = pdfBytes2.buffer.slice(pdfBytes2.byteOffset, pdfBytes2.byteOffset + pdfBytes2.byteLength) as ArrayBuffer;
+      const upRes2 = await uploadToSupabaseStorage(pdfAB2, outFile2, 'application/pdf', c.env.SUPABASE_URL, c.env.SUPABASE_SERVICE_ROLE_KEY);
+      if (upRes2) {
+        await supabase.from('archives').update({ drive_file_id: upRes2.file_path, drive_web_view_link: upRes2.public_url, sync_status: 'synced' }).eq('id', archiveData2.id);
+      }
+      return new Response(pdfAB2 as BodyInit, { status:200, headers: { 'Content-Type':'application/pdf', 'X-Letter-Number':letterNumber, 'X-Archive-Id':archiveData2.id, 'Content-Disposition':`inline; filename="${outFile2}"` }});
+    }
+    return c.json({ message:`Gagal menyimpan arsip: ${dbError.message}` }, 500);
+  }
 
   // ── Generate PDF langsung dari data field ──
   // PDF dihasilkan dari scratch dengan layout surat resmi
