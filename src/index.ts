@@ -746,7 +746,7 @@ app.post('/api/archives/take-number', requireAuth, async (c) => {
     .select().single();
 
   if (error) return c.json({ message: `Gagal menyimpan nomor surat: ${error.message}` }, 500);
-  return c.json({ letterNumber, letterDate }, 201);
+  return c.json({ letterNumber, letterDate, id: data.id }, 200);
 });
 
 // ─────────────────────────────────────────────
