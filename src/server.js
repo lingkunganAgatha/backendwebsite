@@ -851,6 +851,93 @@ app.delete('/api/archives/:id', requireAuth, async (req, res) => {
   res.json({ message: 'Arsip berhasil dihapus' });
 });
 
+// ─────────────────────────────────────────────
+// GET /api/debug/drive  (TEMPORARY — diagnostic only, protected by auth)
+// ─────────────────────────────────────────────
+app.get('/api/debug/drive', requireAuth, async (req, res) => {
+  const report = {
+    env: {
+      GOOGLE_CLIENT_EMAIL: GOOGLE_CLIENT_EMAIL
+        ? GOOGLE_CLIENT_EMAIL.substring(0, 30) + '…'
+        : 'MISSING',
+      GOOGLE_PRIVATE_KEY_LENGTH: GOOGLE_PRIVATE_KEY ? GOOGLE_PRIVATE_KEY.length : 0,
+      GOOGLE_PRIVATE_KEY_STARTS: GOOGLE_PRIVATE_KEY
+        ? GOOGLE_PRIVATE_KEY.substring(0, 40)
+        : 'MISSING',
+      GOOGLE_PRIVATE_KEY_ENDS: GOOGLE_PRIVATE_KEY
+        ? GOOGLE_PRIVATE_KEY.substring(GOOGLE_PRIVATE_KEY.length - 40)
+        : 'MISSING',
+      GOOGLE_DRIVE_ROOT_FOLDER_ID: GOOGLE_DRIVE_ROOT_FOLDER_ID
+        ? GOOGLE_DRIVE_ROOT_FOLDER_ID.substring(0, 10) + '…'
+        : 'MISSING',
+      GOOGLE_PRIVATE_KEY_RAW_SNIPPET:
+        process.env.GOOGLE_PRIVATE_KEY
+          ? process.env.GOOGLE_PRIVATE_KEY.substring(0, 60)
+          : 'MISSING',
+      has_literal_newline: GOOGLE_PRIVATE_KEY ? GOOGLE_PRIVATE_KEY.includes('\n') : false,
+      has_escaped_newline: process.env.GOOGLE_PRIVATE_KEY
+        ? process.env.GOOGLE_PRIVATE_KEY.includes('\\n')
+        : false,
+    },
+    drive_enabled: driveEnabled,
+    drive_client_initialized: !!driveClient,
+  };
+
+  if (!driveEnabled || !driveClient) {
+    return res.json({ status: 'DRIVE_DISABLED', report });
+  }
+
+  // Coba list files di root folder
+  try {
+    const listRes = await driveClient.files.list({
+      q: `'${GOOGLE_DRIVE_ROOT_FOLDER_ID}' in parents and trashed = false`,
+      pageSize: 3,
+      fields: 'files(id, name)',
+    });
+    report.drive_list_test = {
+      status: 'OK',
+      files_found: listRes.data.files.length,
+      sample: listRes.data.files.map((f) => f.name),
+    };
+  } catch (listErr) {
+    report.drive_list_test = {
+      status: 'ERROR',
+      message: listErr.message,
+      code: listErr.code,
+    };
+  }
+
+  // Coba upload file dummy kecil
+  try {
+    const { Readable } = require('stream');
+    const dummyBuffer = Buffer.from('Google Drive connectivity test - Portal Agatha');
+    const stream = Readable.from(dummyBuffer);
+    const uploadRes = await driveClient.files.create({
+      requestBody: {
+        name: `_drive_test_${Date.now()}.txt`,
+        parents: [GOOGLE_DRIVE_ROOT_FOLDER_ID],
+      },
+      media: { mimeType: 'text/plain', body: stream },
+      fields: 'id, webViewLink',
+    });
+    // Hapus file test langsung
+    await driveClient.files.delete({ fileId: uploadRes.data.id }).catch(() => {});
+    report.drive_upload_test = {
+      status: 'OK',
+      file_id: uploadRes.data.id,
+      message: 'Upload & delete berhasil',
+    };
+  } catch (uploadErr) {
+    report.drive_upload_test = {
+      status: 'ERROR',
+      message: uploadErr.message,
+      code: uploadErr.code,
+    };
+  }
+
+  res.json({ status: 'DRIVE_ENABLED', report });
+});
+
 // ═════════════════════════════════════════════
 // Error Handlers
 // ═════════════════════════════════════════════
